@@ -27,6 +27,7 @@ import {
   type NotionPageResponse,
 } from "./notion-api";
 import type { RpcStub } from "cloudflare:workers";
+import { buildDescription } from "@gadgets/gatekeeper-kit/action-description";
 import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   NotionComment,
@@ -674,50 +675,62 @@ export function observation(title: string, description: string): ObservationDesc
 // ---------------------------------------------------------------------------------------------
 // Action descriptions
 
+/**
+ * The approver's text, built so every value the agent supplied (page bodies, comments, titles,
+ * property values, icons) is shown in full inside a fenced block, and the completeness claim is
+ * the builder's.
+ */
 export function describeAction(action: NotionAction): ActionDescription {
   switch (action.type) {
     case "appendContent":
       return {
         title: "Append content to Notion page",
-        description: `Append the following Markdown to the page body:\n\n${truncate(action.markdown)}`,
+        ...buildDescription("Append the following Markdown to the page body.")
+          .verbatim("Content", action.markdown, "markdown")
+          .finish(),
         implementsRevert: true,
       };
     case "setTitle":
       return {
         title: "Rename Notion page",
-        description: `Change the page title to **${action.title}** (was “${action.previousTitle}”).`,
+        ...buildDescription("Change the page title.")
+          .inline("Current title", action.previousTitle)
+          .inline("New title", action.title)
+          .finish(),
         implementsRevert: true,
       };
     case "setProperties":
       return {
         title: "Update Notion page properties",
-        description: `Update properties: ${Object.keys(action.properties).join(", ") || "(none)"}.`,
+        ...buildDescription("Update the page's properties to the values below.")
+          .json("Properties", action.properties)
+          .finish(),
         implementsRevert: true,
       };
     case "setIcon":
       return {
         title: "Change Notion page icon",
-        description: action.icon
-          ? `Set the page icon to ${iconInputDisplay(action.icon)}.`
-          : "Remove the page icon.",
+        ...(action.icon
+          ? buildDescription("Set the page icon.").inline("Icon", iconInputDisplay(action.icon)).finish()
+          : buildDescription("Remove the page icon.").finish()),
         implementsRevert: true,
       };
     case "archive":
       return {
         title: "Move Notion page to trash",
-        description: "Move the page to the Notion trash (reversible).",
+        ...buildDescription("Move the page to the Notion trash (reversible).").finish(),
         implementsRevert: true,
       };
     case "restore":
       return {
         title: "Restore Notion page from trash",
-        description: "Restore the page from the Notion trash.",
+        ...buildDescription("Restore the page from the Notion trash.").finish(),
         implementsRevert: true,
       };
     case "addComment":
       return {
         title: "Comment on Notion page",
-        description: `Post a comment:\n\n${truncate(action.text)}`,
+        ...buildDescription("Post a comment.").verbatim("Comment", action.text).finish(),
         // The Notion public API can't delete comments, so this can't be reverted automatically.
         implementsRevert: false,
       };
@@ -728,17 +741,18 @@ export function describeAction(action: NotionAction): ActionDescription {
         // Workspace-level: the API needs a concrete parent, so the page lands under the most
         // recently edited shared page (chosen when this action is approved).
         : "under the most recently edited shared page (Notion has no true top-level page)";
+      const builder = buildDescription(`Create a new page ${where}.`)
+        .inline("Title", action.title ?? "Untitled");
+      if (action.properties) builder.json("Properties", action.properties);
+      builder.verbatim("Content", action.content ?? "", "markdown");
+      if (action.icon) builder.inline("Icon", iconInputDisplay(action.icon));
       return {
         title: "Create Notion page",
-        description: `Create a new page ${where} titled **${action.title ?? "Untitled"}**.`,
+        ...builder.finish(),
         implementsRevert: true,
       };
     }
   }
-}
-
-function truncate(text: string, max = 2000): string {
-  return text.length > max ? text.slice(0, max) + "…" : text;
 }
 
 // ---------------------------------------------------------------------------------------------
