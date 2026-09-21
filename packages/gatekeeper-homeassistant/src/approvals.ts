@@ -10,6 +10,7 @@
 //   issues the inverse service call to restore that state.
 // - `executeAction()` — actually performs the action against HA (REST or WS).
 
+import { buildDescription } from "@gadgets/gatekeeper-kit/action-description";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
   HomeAssistantWebSocket,
@@ -54,22 +55,6 @@ function labelName(labelId: string, registry: RegistrySnapshot): string {
 function deviceName(deviceId: string, registry: RegistrySnapshot): string {
   const device = registry.devices.find((d: any) => d.id === deviceId);
   return device?.name_by_user ?? device?.name ?? deviceId;
-}
-
-function fmtData(data?: Record<string, unknown>): string {
-  if (!data) return "";
-  const entries = Object.entries(data);
-  if (entries.length === 0) return "";
-  return entries.map(([k, v]) => `${k}=${formatValue(v)}`).join(", ");
-}
-
-function formatValue(v: unknown): string {
-  if (v === null) return "null";
-  if (typeof v === "string") return JSON.stringify(v);
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
-  if (Array.isArray(v)) return `[${v.map(formatValue).join(", ")}]`;
-  if (typeof v === "object") return JSON.stringify(v);
-  return String(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,8 +130,6 @@ function describeCallService(
     };
   }
 
-  const dataStr = fmtData(data);
-
   // Compute the total number of distinct entities affected by this call. Used to enrich
   // titles for area / label / device scopes (where one ID can fan out to many entities), and
   // to display per-area / per-label counts when the target uses only that one dimension.
@@ -168,20 +151,22 @@ function describeCallService(
   let targetText = "";
   if (target) {
     const parts: string[] = [];
+    // Every id is printed: the friendly names are decoration from the registry, the ids are what
+    // the call will actually send.
     if (target.entity_id) {
       const ids = asArray(target.entity_id);
       if (ids.length === 1) {
         parts.push(`${entityFriendlyName(ids[0], registry)} (\`${ids[0]}\`)`);
       } else {
-        parts.push(`${ids.length} entities`);
+        parts.push(`${ids.length} entities (${ids.map((id) => `\`${id}\``).join(", ")})`);
       }
     }
     if (target.device_id) {
       const ids = asArray(target.device_id);
       parts.push(
         ids.length === 1
-          ? `device "${deviceName(ids[0], registry)}"`
-          : `${ids.length} devices`,
+          ? `device "${deviceName(ids[0], registry)}" (\`${ids[0]}\`)`
+          : `${ids.length} devices (${ids.map((id) => `\`${id}\``).join(", ")})`,
       );
     }
     if (target.area_id) {
@@ -193,9 +178,9 @@ function describeCallService(
       parts.push(
         ids.length === 1
           ? includeCount
-            ? `area "${areaName(ids[0], registry)}" (${affectedEntityCount} entities)`
-            : `area "${areaName(ids[0], registry)}"`
-          : `${ids.length} areas`,
+            ? `area "${areaName(ids[0], registry)}" (\`${ids[0]}\`, ${affectedEntityCount} entities)`
+            : `area "${areaName(ids[0], registry)}" (\`${ids[0]}\`)`
+          : `${ids.length} areas (${ids.map((id) => `\`${id}\``).join(", ")})`,
       );
     }
     if (target.label_id) {
@@ -204,9 +189,9 @@ function describeCallService(
       parts.push(
         ids.length === 1
           ? includeCount
-            ? `label "${labelName(ids[0], registry)}" (${affectedEntityCount} entities)`
-            : `label "${labelName(ids[0], registry)}"`
-          : `${ids.length} labels`,
+            ? `label "${labelName(ids[0], registry)}" (\`${ids[0]}\`, ${affectedEntityCount} entities)`
+            : `label "${labelName(ids[0], registry)}" (\`${ids[0]}\`)`
+          : `${ids.length} labels (${ids.map((id) => `\`${id}\``).join(", ")})`,
       );
     }
     if (target.floor_id) {
@@ -239,27 +224,26 @@ function describeCallService(
     if (targetText) title += ` on ${targetText}`;
   }
 
-  // Description — fuller detail for the approver.
-  let description = `Calls \`${domain}.${service}\``;
-  if (targetText) description += ` on ${targetText}`;
-  if (dataStr) description += ` with ${dataStr}`;
-  description += ".";
+  // Description — the prose names the call; the JSON is the exact target and data it sends.
+  const builder = buildDescription(
+    `Calls \`${domain}.${service}\`${targetText ? ` on ${targetText}` : ""}.`);
+  if (target) builder.json("Target", target);
+  if (data && Object.keys(data).length > 0) builder.json("Service data", data);
 
   return {
     title,
-    description,
+    ...builder.finish(),
     implementsRevert: canRevert(action),
   };
 }
 
 function describeFireEvent(action: HomeAssistantAction & { type: "fireEvent" }): ActionDescription {
-  const dataStr = fmtData(action.data);
+  const builder = buildDescription(
+    `Fires the \`${action.eventType}\` event on the Home Assistant event bus.`);
+  if (action.data && Object.keys(action.data).length > 0) builder.json("Event data", action.data);
   return {
     title: `Fire event: ${action.eventType}`,
-    description:
-      `Fires the \`${action.eventType}\` event on the Home Assistant event bus` +
-      (dataStr ? ` with ${dataStr}` : "") +
-      ".",
+    ...builder.finish(),
     implementsRevert: false,
   };
 }
@@ -274,9 +258,12 @@ function describeSaveDashboard(
   const title = config?.title ? `${config.title}` : urlLabel;
   return {
     title: `Edit dashboard: ${title}`,
-    description:
+    // A configuration too large for the budget is truncated and, as intended, incomplete.
+    ...buildDescription(
       `Replaces the configuration of the Lovelace dashboard \`${urlLabel}\` ` +
-      `with ${viewCount} view${viewCount === 1 ? "" : "s"} and ${cardCount} card${cardCount === 1 ? "" : "s"}.`,
+      `with ${viewCount} view${viewCount === 1 ? "" : "s"} and ${cardCount} card${cardCount === 1 ? "" : "s"}.`)
+      .json("Dashboard configuration", action.config)
+      .finish(),
     implementsRevert: true,
   };
 }
