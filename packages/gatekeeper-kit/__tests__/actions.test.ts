@@ -828,6 +828,30 @@ describe("defineActions", () => {
     }
   });
 
+  it("forwards a description's claim of completeness, and only a true one", async () => {
+    const complete = bind({ describe: () => ({ ...presentation, descriptionIsComplete: true }) });
+    const submitAction = submitSpy();
+
+    const id = await complete.actions.submit(fakeQueue(submitAction), "execute", { sql: "one" });
+
+    expect(submitAction).toHaveBeenCalledWith(id, {
+      ...presentation,
+      descriptionIsComplete: true,
+      actionKind: { tag: "sql", label: "Run SQL" },
+      autoApprovable: true,
+    });
+
+    // Absent, not `false`: the overseer reads presence as the gatekeeper vouching for the text,
+    // so a hook that omits the claim and one that denies it must look the same on the wire.
+    for (const describe of [() => presentation,
+                            () => ({ ...presentation, descriptionIsComplete: false })]) {
+      const { actions } = bind({ describe });
+      const spy = submitSpy();
+      await actions.submit(fakeQueue(spy), "execute", { sql: "one" });
+      expect(Object.hasOwn(spy.mock.calls[0]![1], "descriptionIsComplete")).toBe(false);
+    }
+  });
+
   it("puts no pushedCommits key on the wire when the description declares none", async () => {
     // Absent, not `undefined`: the overseer reads presence as "this action pushes".
     const { actions } = bind();
