@@ -1077,15 +1077,50 @@ describe("Gmail forward action snapshots", () => {
   });
 
   it("fails closed when rendering would exceed the approval description limit", async () => {
-    const {gatekeeper} = actionHarness(url => {
+    // An outbound body is capped well under the description budget, but an inline forward quotes
+    // the whole source message, which is not.
+    const sourceRaw = buildEncodedEmail({
+      from: "source@example.com",
+      to: ["me@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Source subject",
+      text: "x".repeat(100 * 1024),
+      messageId: "<oversize-source@gadgets.invalid>",
+      attachments: [],
+    });
+    const {gatekeeper} = actionHarness((url, init) => {
+      if (url.pathname === "/gmail/v1/users/me/messages" && !init.method) {
+        return url.searchParams.has("q")
+          ? json({messages: []})
+          : json({messages: [{id: "source-message", threadId: "source-thread"}]});
+      }
+      if (url.pathname === "/gmail/v1/users/me/messages/source-message" && !init.method) {
+        if (url.searchParams.get("format") === "raw") {
+          return json({id: "source-message", threadId: "source-thread", internalDate: "1", raw: sourceRaw});
+        }
+        return json({
+          id: "source-message", threadId: "source-thread", internalDate: "1",
+          sizeEstimate: base64UrlDecodedByteLength(sourceRaw), labelIds: [],
+          payload: {headers: [
+            {name: "From", value: "source@example.com"},
+            {name: "To", value: "me@example.com"},
+            {name: "Subject", value: "Source subject"},
+            {name: "Message-ID", value: "<oversize-source@gadgets.invalid>"},
+          ]},
+        });
+      }
+      if (url.pathname === "/gmail/v1/users/me/labels" && !init.method) {
+        return json({labels: []});
+      }
       throw new Error(`Unexpected request: ${url}`);
     });
     const queue = approvalQueue();
     const session = await gatekeeper.startSession(queue);
+    const messages = await (await session.listMessages()).next();
 
-    await expect(session.send(
-      ["to@example.com"], "Subject", "x\n".repeat(32 * 1024),
-    )).rejects.toThrow(/exceeds.*approval description limit/i);
+    await expect(messages![0].message.forward(["to@example.com"], "Intro"))
+      .rejects.toThrow(/exceeds.*approval description limit/i);
     expect((await queue.read!()).submissions).toHaveLength(0);
   });
 
