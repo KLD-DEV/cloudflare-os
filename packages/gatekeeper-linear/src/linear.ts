@@ -17,6 +17,7 @@ import {
   SupportedResource,
   ResourceConfiguratorFrame,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import type {
@@ -961,7 +962,9 @@ type StoredActionDraft = StoredAction extends infer T
   ? T extends { id: number } ? Omit<T, "id" | "status"> : never
   : never;
 
-type ActionDescriptionDraft = { title: string; body: string; implementsRevert: boolean };
+// The approver-facing text is always built with `buildDescription`, so every value the agent
+// supplied is shown in full and the completeness claim is the builder's, never hand-set.
+type ActionDescriptionDraft = { title: string; implementsRevert: boolean } & RenderedDescription;
 
 type LinearGatekeeperImplProps = {
   userObjectId: string;
@@ -1140,11 +1143,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     const id = this.#nextCounter("action");
     this.ctx.storage.kv.put<StoredAction>(`action:${id}`, { ...action, id, status: "pending" } as StoredAction);
     this.#invalidatePendingActions();
-    await approvalQueue.submitAction(id, {
-      title: description.title,
-      description: description.body,
-      implementsRevert: description.implementsRevert,
-    });
+    await approvalQueue.submitAction(id, description);
   }
 
   // ---- simulation: overlay pending (submitted-but-not-applied) actions onto reads ----
@@ -1987,7 +1986,11 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
         synthetic, title: `Create label "${name}"` },
       {
         title: `Create label "${name}" in ${team.key}`,
-        body: `Create a new label named **${name}**${options?.color ? ` (color ${options.color})` : ""} in team ${team.key}.`,
+        ...buildDescription(`Create a new label in team ${team.key}.`)
+          .inline("Name", name)
+          .inline("Color", options?.color ?? "(default)")
+          .verbatim("Description", options?.description ?? "")
+          .finish(),
         implementsRevert: true,
       },
     );
@@ -2084,7 +2087,10 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       { kind: "updateIssue", issueRef: this.#ref, input: { title },
         previous: { title: issue.title }, patch: { title }, title: `Set title of ${issue.identifier}` },
       { title: `Rename ${issue.identifier}`,
-        body: `Change the title of **${issue.identifier}** from "${issue.title}" to "${title}".`,
+        ...buildDescription(`Change the title of **${issue.identifier}**.`)
+          .inline("Current title", issue.title)
+          .inline("New title", title)
+          .finish(),
         implementsRevert: true },
     );
   }
@@ -2097,7 +2103,9 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { description: issue.description ?? "" }, patch: { description: descriptionMarkdown },
         title: `Edit description of ${issue.identifier}` },
       { title: `Edit description of ${issue.identifier}`,
-        body: `Replace the description of **${issue.identifier} ${issue.title}**.`,
+        ...buildDescription(`Replace the description of **${issue.identifier} ${issue.title}**.`)
+          .verbatim("New description", descriptionMarkdown, "markdown")
+          .finish(),
         implementsRevert: true },
     );
   }
@@ -2115,7 +2123,9 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { stateId: issue.state?.id }, patch: { state: target },
         title: `Move ${issue.identifier} to ${target.name}` },
       { title: `Move ${issue.identifier} to ${target.name}`,
-        body: `Change the state of **${issue.identifier} ${issue.title}** from "${issue.state?.name ?? "Unknown"}" to "${target.name}".`,
+        ...buildDescription(
+          `Change the state of **${issue.identifier} ${issue.title}** from ` +
+          `"${issue.state?.name ?? "Unknown"}" to "${target.name}".`).finish(),
         implementsRevert: true },
     );
   }
@@ -2136,7 +2146,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { assigneeId: issue.assignee?.id ?? null }, patch: { assignee: assigneeUser },
         title: `${label} (${issue.identifier})` },
       { title: `${label}: ${issue.identifier}`,
-        body: `${label} for issue **${issue.identifier} ${issue.title}**.`,
+        ...buildDescription(`${label} for issue **${issue.identifier} ${issue.title}**.`).finish(),
         implementsRevert: true },
     );
   }
@@ -2149,7 +2159,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { priority: issue.priority }, patch: { priority: PRIORITY_TO_NUM[priority] },
         title: `Set priority of ${issue.identifier}` },
       { title: `Set priority of ${issue.identifier} to ${priority}`,
-        body: `Change the priority of **${issue.identifier} ${issue.title}** to "${priority}".`,
+        ...buildDescription(
+          `Change the priority of **${issue.identifier} ${issue.title}** to "${priority}".`).finish(),
         implementsRevert: true },
     );
   }
@@ -2175,7 +2186,9 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       { kind: "addLabels", issueRef: this.#ref, labelIds: resolved.map(l => l.id), labels: resolved,
         title: `Add labels to ${issue.identifier}` },
       { title: `Add labels to ${issue.identifier}`,
-        body: `Add label(s) ${labels.map(l => `"${l}"`).join(", ")} to **${issue.identifier} ${issue.title}**.`,
+        ...buildDescription(`Add labels to **${issue.identifier} ${issue.title}**.`)
+          .list("Labels", resolved.map(l => l.name))
+          .finish(),
         implementsRevert: true },
     );
   }
@@ -2191,7 +2204,9 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "removeLabels", issueRef: this.#ref, labelIds: removeIds, title: `Remove labels from ${issue.identifier}` },
       { title: `Remove labels from ${issue.identifier}`,
-        body: `Remove label(s) ${labels.map(l => `"${l}"`).join(", ")} from **${issue.identifier} ${issue.title}**.`,
+        ...buildDescription(`Remove labels from **${issue.identifier} ${issue.title}**.`)
+          .list("Labels", labels)
+          .finish(),
         implementsRevert: true },
     );
   }
@@ -2206,9 +2221,11 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { projectId: issue.project?.id ?? null }, patch: { project },
         title: `Set project of ${issue.identifier}` },
       { title: `${projectId ? "Move" : "Remove"} ${issue.identifier} ${projectId ? "into a project" : "from its project"}`,
-        body: projectId
-          ? `Move **${issue.identifier} ${issue.title}** into project ${projectId}.`
-          : `Remove **${issue.identifier} ${issue.title}** from its project.`,
+        ...(projectId
+          ? buildDescription(`Move **${issue.identifier} ${issue.title}** into a project.`)
+            .inline("Project", projectId).finish()
+          : buildDescription(`Remove **${issue.identifier} ${issue.title}** from its project.`)
+            .finish()),
         implementsRevert: true },
     );
   }
@@ -2221,9 +2238,11 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { dueDate: issue.dueDate ?? null }, patch: { dueDate: date },
         title: `Set due date of ${issue.identifier}` },
       { title: `Set due date of ${issue.identifier}`,
-        body: date
-          ? `Set the due date of **${issue.identifier} ${issue.title}** to ${date}.`
-          : `Clear the due date of **${issue.identifier} ${issue.title}**.`,
+        ...(date
+          ? buildDescription(`Set the due date of **${issue.identifier} ${issue.title}**.`)
+            .inline("Due date", date).finish()
+          : buildDescription(`Clear the due date of **${issue.identifier} ${issue.title}**.`)
+            .finish()),
         implementsRevert: true },
     );
   }
@@ -2246,9 +2265,11 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { parentId: issue.parent?.id ?? null }, patch: { parent: parentOverlay },
         title: `Set parent of ${issue.identifier}` },
       { title: `${parentId ? "Set" : "Clear"} parent of ${issue.identifier}`,
-        body: parentId
-          ? `Make **${issue.identifier} ${issue.title}** a sub-issue of ${parentId}.`
-          : `Detach **${issue.identifier} ${issue.title}** from its parent.`,
+        ...(parentId
+          ? buildDescription(`Make **${issue.identifier} ${issue.title}** a sub-issue.`)
+            .inline("Parent issue", parentId).finish()
+          : buildDescription(`Detach **${issue.identifier} ${issue.title}** from its parent.`)
+            .finish()),
         implementsRevert: true },
     );
   }
@@ -2282,7 +2303,9 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "postComment", issueRef: this.#ref, body: bodyMarkdown, synthetic, title: `Comment on ${issue.identifier}` },
       { title: `Comment on ${issue.identifier}`,
-        body: `Post a comment on **${issue.identifier} ${issue.title}**:\n\n${bodyMarkdown}`,
+        ...buildDescription(`Post a comment on **${issue.identifier} ${issue.title}**.`)
+          .verbatim("Comment", bodyMarkdown, "markdown")
+          .finish(),
         implementsRevert: true },
     );
   }
@@ -2304,7 +2327,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "archive", issueRef: this.#ref, archived: true, title: `Archive ${issue.identifier}` },
       { title: `Archive ${issue.identifier}`,
-        body: `Archive issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true },
+        ...buildDescription(`Archive issue **${issue.identifier} ${issue.title}**.`).finish(),
+        implementsRevert: true },
     );
   }
 
@@ -2314,13 +2338,41 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "archive", issueRef: this.#ref, archived: false, title: `Unarchive ${issue.identifier}` },
       { title: `Unarchive ${issue.identifier}`,
-        body: `Restore archived issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true },
+        ...buildDescription(`Restore archived issue **${issue.identifier} ${issue.title}**.`).finish(),
+        implementsRevert: true },
     );
   }
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
+
+// Every field the new issue will carry, with the agent's values shown in full and the resolved
+// provider objects named beside them.
+function describeCreateIssue(
+  team: RawTeam,
+  options: LinearCreateIssueOptions,
+  resolved: {
+    stateObj: RawWorkflowState | null;
+    assigneeObj: RawUser | null;
+    labelObjs: RawLabel[];
+    parentObj: RawIssue["parent"];
+  },
+): RenderedDescription {
+  const builder = buildDescription(`Create a new issue in team ${team.key}.`)
+    .inline("Title", options.title)
+    .verbatim("Description", options.descriptionMarkdown ?? "", "markdown");
+  if (resolved.stateObj) builder.inline("State", resolved.stateObj.name);
+  if (resolved.assigneeObj) {
+    builder.inline("Assignee", resolved.assigneeObj.displayName ?? resolved.assigneeObj.name);
+  }
+  if (resolved.labelObjs.length) builder.list("Labels", resolved.labelObjs.map(l => l.name));
+  if (options.priority) builder.inline("Priority", options.priority);
+  if (options.projectId) builder.inline("Project", options.projectId);
+  if (options.dueDate) builder.inline("Due date", options.dueDate);
+  if (resolved.parentObj) builder.inline("Parent issue", resolved.parentObj.identifier);
+  return builder.finish();
+}
 
 function issueArgs(filter: LinearIssueFilter | undefined): IssuePageArgs {
   return {
@@ -2421,7 +2473,7 @@ async function createIssueViaQueue(
     queue,
     { kind: "createIssue", input, provisionalId, synthetic, title: `Create issue "${options.title}"` },
     { title: `Create issue "${options.title}"`,
-      body: `Create a new issue titled **${options.title}**${options.assignee ? `, assigned to ${options.assignee}` : ""}.`,
+      ...describeCreateIssue(team, options, { stateObj, assigneeObj, labelObjs, parentObj }),
       implementsRevert: true },
   );
 
