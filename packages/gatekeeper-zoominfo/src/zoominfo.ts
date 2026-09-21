@@ -16,6 +16,7 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { buildDescription } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
@@ -1096,10 +1097,15 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     try {
       await this.#approvalQueue.submitAction(id, {
         title: `ZoomInfo: ${summary}`,
-        description:
-            `${summary}\n\n**Credit cost:** up to **${worstCaseCredits}** ZoomInfo bulk-data ` +
-            `credit${worstCaseCredits === 1 ? "" : "s"} (fewer if records are already under ` +
-            `management; none for no-match/error results). Charged only on approval.`,
+        // The request body is what leaves the workspace (names, emails, company identifiers), so
+        // the approver sees it exactly, after the summary and the cost.
+        ...buildDescription(
+          `${summary}\n\n**Credit cost:** up to **${worstCaseCredits}** ZoomInfo bulk-data ` +
+          `credit${worstCaseCredits === 1 ? "" : "s"} (fewer if records are already under ` +
+          `management; none for no-match/error results). Charged only on approval.`)
+          .json("Request", attributes)
+          .json("Page", page ?? {})
+          .finish(),
         // Spent credits can't be refunded, so there is no automatic revert.
         implementsRevert: false,
         // No simulation: suspend the agent until the user decides rather than letting it read back
@@ -1203,7 +1209,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     const matchCompanyInput = inputs.map(input => clean({ ...input, companyId: idValue(input.companyId) }));
     return this.#submitEnrichment(
       "corporateHierarchy",
-      `Enrich corporate hierarchy for ${inputs.length} compan${inputs.length === 1 ? "y" : "ies"}`,
+      `Enrich corporate hierarchy for ${inputs.length} compan${inputs.length === 1 ? "y" : "ies"}, ` +
+        `requesting fields: ${outputFields.join(", ") || "(none)"}`,
       { matchCompanyInput, outputFields },
       inputs.length,
     );
