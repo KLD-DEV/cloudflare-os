@@ -710,10 +710,12 @@ export const ChatComposer = ({
           {slashCommandPicker.popup}
           {/* The resolved command is marked by color alone, so announce it for screen readers. */}
           <div className="sr-only" aria-live="polite">
-            {slashCommandPicker.status ||
-              (selectedSlashCommand
-                ? `Slash command /${selectedSlashCommand.choice.name} from ${selectedSlashCommand.choice.providerLabel} is ready to send`
-                : "")}
+            <span>
+              {slashCommandPicker.status ||
+                (selectedSlashCommand
+                  ? `Slash command /${selectedSlashCommand.choice.name} from ${selectedSlashCommand.choice.providerLabel} is ready to send`
+                  : null)}
+            </span>
           </div>
           <div ref={wrapperRef} className={styles.capsuleInputWrapper}>
             {activeUrl && (
