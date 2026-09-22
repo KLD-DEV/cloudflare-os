@@ -144,6 +144,17 @@ export interface SlackWorkspaceSession {
    *  "from:@bob in:#engineering budget"). The query must be non-empty and at most 1,000 UTF-8
    *  bytes. */
   search(query: string): Promise<Cursor<SlackMessageEntry>>;
+
+  /**
+   * Post `text` as the connected user to a channel, direct message, or group DM they can post in.
+   * `conversationId` is that conversation's Slack ID. `threadTs`, when set, replies in that thread
+   * instead of starting a new message.
+   *
+   * Delivery can lag this call. The returned message carries the text that will appear; Slack
+   * assigns `ts` and `permalink` when it accepts the post, so those fields are empty here. Read
+   * the conversation afterwards to obtain them.
+   */
+  postMessage(conversationId: string, text: string, threadTs?: string): Promise<SlackMessage>;
 }
 
 /**

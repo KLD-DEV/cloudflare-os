@@ -3,7 +3,8 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   GatekeeperUser, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription,
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
-  AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
+  AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, ActionDescription,
+  Cursor,
   GatekeeperUserVerifier, ObservationDescription,
   stripTrailingSlashes, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -115,8 +116,9 @@ const WORKSPACE_RESOURCE: SupportedResource = {
   urlPattern: "https://*",
   title: "Slack Workspace",
   description:
-      "Read channels, direct messages, members, and search across the whole connected workspace. " +
-      "The workspace is auto-detected from the connected account — no URL or ID need be supplied.",
+      "Read and post in channels, direct messages, and threads across the whole connected " +
+      "workspace. Posts are sent as the connected user. The workspace is auto-detected from the " +
+      "connected account — no URL or ID need be supplied.",
   grantable: true,
 };
 
@@ -144,7 +146,7 @@ const CONVERSATION_READ_SCOPES = [
 const RESOURCE_SCOPES: { resource: SupportedResource; scopes: string[] }[] = [
   {
     resource: WORKSPACE_RESOURCE,
-    scopes: ["team:read", ...CONVERSATION_READ_SCOPES, "search:read"],
+    scopes: ["team:read", ...CONVERSATION_READ_SCOPES, "search:read", "chat:write"],
   },
   {
     resource: CONVERSATION_RESOURCE,
@@ -244,7 +246,7 @@ export default {
       let authUrl = new URL("https://slack.com/oauth/v2/authorize");
       authUrl.searchParams.set("client_id", env.CLIENT_ID);
       authUrl.searchParams.set("redirect_uri", getBaseUrl(env) + "/oauth");
-      // User scopes produce the read-only user token needed for private channels and DMs.
+      // User scopes produce a user token, so the agent sees and posts as the connecting user.
       authUrl.searchParams.set("user_scope", begun.scopes.join(","));
       authUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
       return Response.redirect(authUrl.toString(), 302);
@@ -285,11 +287,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       url: "https://slack.com",
       logo: { url: SLACK_LOGO_URL },
       color: "#f4ede4",
-      tagline: "Read channels, DMs, and threads",
+      tagline: "Read and post in channels, DMs, and threads",
       description:
-          "Connect your Slack account to give Cloudflare OS read-only access to the workspaces, " +
-          "channels, direct messages, and threads you can see. Build agents that summarize " +
-          "conversations, monitor channels, or search across your Slack history.",
+          "Connect your Slack account to read the workspaces, channels, direct messages, and " +
+          "threads you can see, and to post as you in a workspace-wide connection.",
     };
   }
 
@@ -876,8 +877,28 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
 
 const NO_ACTIONS: ActionKind[] = [];
 
+const POST_MESSAGE_ACTION: ActionKind = {
+  tag: "slack.postMessage",
+  label: "Post a Slack message",
+};
+
+const SLACK_POST_TEXT_LIMIT = 40_000;
+
+type SlackPostAction = {
+  conversationId: string;
+  text: string;
+  threadTs?: string;
+  label: string;
+};
+
+type SlackPostRecord = {
+  action: SlackPostAction;
+  state: "pending" | "applying" | "applied";
+  ts?: string;
+};
+
 function unreachableAction(): never {
-  throw new Error("Slack gatekeeper is read-only and submits no actions.");
+  throw new Error("This Slack connection is read-only and submits no actions.");
 }
 
 type SlackWorkspaceGatekeeperImplProps = {
@@ -1034,9 +1055,79 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  applyAction(): Promise<void> { return unreachableAction(); }
-  rejectAction(): Promise<void> { return unreachableAction(); }
-  revertAction(): Promise<void> { return unreachableAction(); }
+  async submitPost(queue: RpcStub<ApprovalQueue>, action: SlackPostAction): Promise<void> {
+    let id = this.#nextActionId();
+    let key = this.#postKey(id);
+    this.ctx.storage.kv.put<SlackPostRecord>(key, { action, state: "pending" });
+    let description: ActionDescription = {
+      title: action.threadTs ? `Reply in Slack ${action.label}` : `Post to Slack ${action.label}`,
+      description:
+          `Post as the connected user` +
+          `${action.threadTs ? ` in a thread (${action.threadTs})` : ""}.\n\n${action.text}`,
+      implementsRevert: true,
+      // The post is not reflected in later reads until Slack accepts it.
+      awaitDecision: true,
+      actionKind: POST_MESSAGE_ACTION,
+    };
+    try {
+      await queue.submitAction(id, description);
+    } catch (error) {
+      this.ctx.storage.kv.delete(key);
+      throw error;
+    }
+  }
+
+  async applyAction(action: number): Promise<void> {
+    let key = this.#postKey(action);
+    let record = this.ctx.storage.kv.get<SlackPostRecord>(key);
+    if (!record) throw new Error(`No Slack post with id ${action}.`);
+    if (record.state === "applied" && record.ts) return;
+    this.ctx.storage.kv.put<SlackPostRecord>(key, { ...record, state: "applying" });
+    try {
+      let posted = await this.#api().postMessage(
+          record.action.conversationId, record.action.text, record.action.threadTs);
+      this.ctx.storage.kv.put<SlackPostRecord>(key, {
+        ...record, state: "applied", ts: posted.ts,
+      });
+    } catch (error) {
+      this.ctx.storage.kv.put<SlackPostRecord>(key, { ...record, state: "pending" });
+      throw error;
+    }
+  }
+
+  async rejectAction(action: number): Promise<void> {
+    this.ctx.storage.kv.delete(this.#postKey(action));
+  }
+
+  async revertAction(action: number):
+      Promise<void | { message?: string; canRetry?: boolean }> {
+    let key = this.#postKey(action);
+    let record = this.ctx.storage.kv.get<SlackPostRecord>(key);
+    if (!record?.ts) {
+      return { message: "This Slack message was not posted, so there is nothing to remove." };
+    }
+    try {
+      await this.#api().deleteMessage(record.action.conversationId, record.ts);
+    } catch (error) {
+      if (error instanceof SlackApiError && error.code === "message_not_found") {
+        this.ctx.storage.kv.delete(key);
+        return;
+      }
+      return {
+        message: error instanceof Error ? error.message : "Failed to delete the Slack message.",
+        canRetry: true,
+      };
+    }
+    this.ctx.storage.kv.delete(key);
+  }
+
+  #postKey(id: number): string { return `post:${id}`; }
+
+  #nextActionId(): number {
+    let next = (this.ctx.storage.kv.get<number>("counter:nextActionId") ?? 0) + 1;
+    this.ctx.storage.kv.put("counter:nextActionId", next);
+    return next;
+  }
 }
 
 type SlackConversationGatekeeperImplProps = {
@@ -1276,6 +1367,43 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
       let entries = page.items.map(match => messageEntry(ctx, match.channelId, match.message));
       return { items: entries, nextCursor: page.nextCursor };
     });
+  }
+
+  async postMessage(
+      conversationId: string, text: string, threadTs?: string): Promise<SlackMessage> {
+    let channel = conversationId.trim();
+    if (!channel) throw new Error("conversationId is required.");
+    if (typeof text !== "string" || !text.trim()) throw new Error("Message text is required.");
+    if (text.length > SLACK_POST_TEXT_LIMIT) {
+      throw new Error("Message text exceeds Slack's 40,000 character limit.");
+    }
+    if (threadTs !== undefined && !/^\d+\.\d+$/.test(threadTs)) {
+      throw new Error("threadTs must be a Slack message timestamp.");
+    }
+    if (!this.#ctx.tracker) {
+      throw new Error("Posting requires a workspace-wide Slack connection.");
+    }
+
+    let info = await this.#ctx.api.getConversationInfo(channel);
+    await authorizeConversationObservation(this.#ctx, [info.id], {
+      title: `Look up Slack conversation ${info.name ? "#" + info.name : info.id}`,
+      description: `Resolve ${conversationLabel(info)} before posting.`,
+    });
+    await this.#ctx.tracker.submitPost(this.#ctx.approvalQueue, {
+      conversationId: info.id,
+      text,
+      threadTs,
+      label: info.name ? `#${info.name}` : conversationLabel(info),
+    });
+    return {
+      ts: "",
+      author: null,
+      text,
+      timestamp: new Date(),
+      threadTs,
+      reactions: [],
+      files: [],
+    };
   }
 }
 

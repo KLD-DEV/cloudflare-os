@@ -1,10 +1,11 @@
 # Slack gatekeeper
 
-Mediates a Gadget's **read-only** access to a user's [Slack](https://slack.com) workspace:
-channels, direct messages, threads, members, and search. Runs as its own Cloudflare Worker and is
+Mediates a Gadget's access to a user's [Slack](https://slack.com) workspace: channels, direct
+messages, threads, members, and search. A workspace-wide connection can also post as that user. Runs as its own Cloudflare Worker and is
 auto-discovered by the backend from its `GATEKEEPER_SLACK` binding.
 
-This gatekeeper is read-only and never sends or modifies Slack data.
+This gatekeeper reads a user's Slack workspace and, on a workspace-wide connection, posts as that
+user. Channel, DM, and thread connections stay read-only.
 
 ## Auth
 
@@ -41,7 +42,7 @@ and thread URLs take precedence. Channels and DMs share one "Conversation" grant
 
 ### Scopes per resource (user token scopes)
 
-- **Workspace**: `team:read`, conversation read scopes, `search:read`
+- **Workspace**: `team:read`, conversation read scopes, `search:read`, `chat:write`
 - **Conversation**: conversation read scopes, `search:read`
 - **Thread**: `channels:history`, `groups:history`, `im:history`, `mpim:history`
 - **Always**: `users:read`
@@ -53,7 +54,7 @@ where the conversation read scopes are `channels`/`groups`/`im`/`mpim` `:read` +
 See `src/types.d.ts` for the full Session API (the agent-facing documentation). Highlights:
 
 - `SlackWorkspaceSession`: `getInfo`, `listChannels`, `listDirectMessages`, `listUsers`,
-  `getUser`, `getConversation`, `search`
+  `getUser`, `getConversation`, `search`, `postMessage`
 - `SlackConversation`: `getInfo`, `members`, `listMessages`, `getThread`, `search`
   (conversation-scoped search is **hard-restricted** to the bound conversation regardless of query)
 - `SlackThread`: `getRoot`, `listReplies`

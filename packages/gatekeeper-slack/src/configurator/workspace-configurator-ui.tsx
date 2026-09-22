@@ -18,7 +18,7 @@ export default {
     return <Section>
       <Field
         label="Whole workspace"
-        description="This connection lets the client read the channels and direct messages you can access, browse Slack workspace members, and search messages."
+        description="This connection lets the client read the channels and direct messages you can access, browse Slack workspace members, search messages, and post as you."
       >
         <span />
       </Field>

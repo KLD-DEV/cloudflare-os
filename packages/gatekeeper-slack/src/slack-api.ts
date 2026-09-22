@@ -338,16 +338,30 @@ export class SlackApi {
   // ── Low-level request helper ──────────────────────────────────────
 
   async #call<T extends SlackApiEnvelope>(
-      method: string, params: Record<string, string | number | undefined>): Promise<T> {
+      method: string, params: Record<string, string | number | undefined>,
+      httpMethod: "GET" | "POST" = "GET"): Promise<T> {
     let url = new URL(`${SLACK_API_BASE}/${method}`);
-    for (let [key, value] of Object.entries(params)) {
-      if (value !== undefined) url.searchParams.set(key, String(value));
+    let body: URLSearchParams | undefined;
+    if (httpMethod === "POST") {
+      body = new URLSearchParams();
+      for (let [key, value] of Object.entries(params)) {
+        if (value !== undefined) body.set(key, String(value));
+      }
+    } else {
+      for (let [key, value] of Object.entries(params)) {
+        if (value !== undefined) url.searchParams.set(key, String(value));
+      }
     }
 
     for (let attempt = 0; ; attempt++) {
       let token = await this.#getToken();
       let response = await fetch(url.toString(), {
-        headers: { "Authorization": `Bearer ${token}` },
+        method: httpMethod,
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          ...(body ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+        },
+        body,
       });
 
       if (response.status === 429 && attempt < RATE_LIMIT_MAX_RETRIES) {
@@ -377,6 +391,21 @@ export class SlackApi {
   async authedTeamId(): Promise<string> {
     let data = await this.#call<SlackApiEnvelope & { team_id?: string }>("auth.test", {});
     return data.team_id ?? "";
+  }
+
+  /** Post as the connected user. `threadTs` replies in that thread. */
+  async postMessage(channel: string, text: string, threadTs?: string): Promise<SlackMessage> {
+    let data = await this.#call<SlackApiEnvelope & { ts?: string; message?: RawMessage }>(
+        "chat.postMessage", { channel, text, thread_ts: threadTs }, "POST");
+    let raw = data.message ?? { ts: data.ts ?? "", text };
+    if (raw.user) await this.getUser(raw.user).catch(() => undefined);
+    let [message] = await this.#withPermalinks(channel, [this.#toMessage(raw)]);
+    return message;
+  }
+
+  /** Delete a message the connected user posted. */
+  async deleteMessage(channel: string, ts: string): Promise<void> {
+    await this.#call("chat.delete", { channel, ts }, "POST");
   }
 
   async getWorkspaceInfo(): Promise<SlackWorkspaceInfo> {
