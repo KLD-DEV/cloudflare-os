@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -95,6 +95,53 @@ export const CLOUDFLARE_VENDOR_ID = "cloudflare";
 export type UserAiModelRecord = {
   profile: AiChatAuthorInfo;
   config: AiModelConfig;
+}
+
+const withholdSecret = (secret: string) => secret === "" ? "" : null;
+
+/** Withholds the non-empty secrets of `config`, for returning it to a client. */
+function redactModelConfig(config: AiModelConfig): RedactedAiModelConfig {
+  let {apiToken, extraHeaders, ...rest} = config;
+  return {
+    ...rest,
+    apiToken: withholdSecret(apiToken),
+    ...(extraHeaders && {extraHeaders: Object.fromEntries(
+        Object.entries(extraHeaders).map(([name, value]) => [name, withholdSecret(value)]))}),
+  };
+}
+
+/**
+ * Fills in the `null` secrets of `config` from `source`, throwing if `source` is absent or doesn't
+ * hold them. Secrets only carry over to the endpoint they were configured for: otherwise a client
+ * could point the model at its own server and receive them.
+ */
+function resolveWithheldSecrets(
+    config: RedactedAiModelConfig, source?: AiModelConfig): AiModelConfig {
+  let resolve = (secret: string | null, stored: string | undefined, what: string) => {
+    if (secret !== null) return secret;
+    if (!source) {
+      throw new Error(`A value for ${what} is required.`);
+    }
+    if (source.provider !== config.provider || (source.apiUrl ?? "") !== (config.apiUrl ?? "")) {
+      throw new Error(`Please re-enter ${what}, since the provider or API URL changed.`);
+    }
+    if (stored === undefined) {
+      throw new Error(`There is no stored ${what} to keep.`);
+    }
+    return stored;
+  };
+
+  let storedHeader = (name: string) => source?.extraHeaders && Object.hasOwn(source.extraHeaders, name)
+      ? source.extraHeaders[name] : undefined;
+
+  let {apiToken, extraHeaders, ...rest} = config;
+  return {
+    ...rest,
+    apiToken: resolve(apiToken, source?.apiToken, "the API token"),
+    ...(extraHeaders && {extraHeaders: Object.fromEntries(
+        Object.entries(extraHeaders).map(([name, value]) =>
+            [name, resolve(value, storedHeader(name), `the value of header "${name}"`)]))}),
+  };
 }
 
 export type UserChatContext = {
@@ -253,6 +300,14 @@ function makeUserStorage(storage: DurableObjectStorage) {
       //
       // null = password disabled (e.g. because some other auth mechanism is used)
       passwordHashHash: <Uint8Array | null>null,
+      // Current profile revision, bumped every time the user updates their
+      // public-facing profile. Currently this is only bumped when the user
+      // changes their display name.
+      profileRev: 0,
+      // Profile revision the deployment-wide user directory last acknowledged
+      // (-1 = never, which also lazily backfills users created before the
+      // directory existed). See #syncDirectory().
+      directoryRev: -1,
     }
   });
 }
@@ -333,6 +388,29 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
+  // Mirrors the profile into the deployment-wide user directory. Best-effort
+  // and does not block the caller. The `syncUser` call opens this DO's input
+  // gate, so a rename can start a second sync while one is in flight, and the
+  // two can reach the directory in either order. Each sync carries its
+  // `profileRev` and the directory keeps the highest, so no ordering is needed
+  // here. The revision counter only increases, and a failed sync leaves it
+  // behind so the next authentication retries.
+  #syncDirectory(): void {
+    const rev = this.storage.profileRev.get();
+    if (rev === this.storage.directoryRev.get()) return;
+    const profile = this.storage.profile.get();
+    this.ctx.exports.UserDirectoryDurableObject.getByName("")
+        .syncUser({ id: profile.id, name: profile.name }, rev)
+        .then(() => {
+          if (rev > this.storage.directoryRev.get()) this.storage.directoryRev.put(rev);
+        }, (error: unknown) => {
+          logger.warn("failed to sync user directory record", {
+            event: "user.directory.sync.failed",
+            error,
+          });
+        });
+  }
+
   async authenticate(token: string): Promise<void> {
     let tokenBytes: Uint8Array;
     try {
@@ -348,6 +426,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!session) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
+    this.#syncDirectory();
   }
 
   /**
@@ -356,7 +435,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * existing users can still sign in.
    */
   async authenticateFromCfAccess(email: string, allowCreate: boolean): Promise<boolean> {
-    if (!this.storage.created.get()) {
+    const isNew = !this.storage.created.get();
+    if (isNew) {
       if (!allowCreate) {
         throw new Error("New sign-ups are currently disabled on this deployment.");
       }
@@ -367,10 +447,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         name: email.split("@")[0],
         id: email,
       });
-      return true;
     }
-
-    return false;
+    this.#syncDirectory();
+    return isNew;
   }
 
   async #newSessionToken(): Promise<string> {
@@ -551,6 +630,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let profile = this.storage.profile.get();
     profile.name = name;
     this.storage.profile.put(profile);
+    this.storage.profileRev.put(this.storage.profileRev.get() + 1);
+    this.#syncDirectory();
+  }
+
+  async setOwnCommitEmail(email: string | null): Promise<void> {
+    let profile = this.storage.profile.get();
+    if (email === null) {
+      delete profile.commitEmail;
+    } else {
+      validateCommitEmail(email);
+      profile.commitEmail = email;
+    }
+    this.storage.profile.put(profile);
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
@@ -575,10 +667,51 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return result;
   }
 
-  async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+  async addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
+                 copySecretsFrom?: string): Promise<void> {
+    let source: AiModelConfig | undefined;
+    if (copySecretsFrom !== undefined) {
+      source = this.#getHandAddedModel(copySecretsFrom).config;
+    }
+    if (this.storage.aiModels.get(profile.id) ||
+        (source && getAiGatewayConfig(this.env)?.resolveModel(profile.id))) {
+      throw new Error(`A model with ID "${profile.id}" already exists.`);
+    }
+    this.#putModel(profile, resolveWithheldSecrets(config, source));
+  }
+
+  async getModelConfig(id: string): Promise<{profile: AiChatAuthorInfo, config: RedactedAiModelConfig}> {
+    let {profile, config} = this.#getHandAddedModel(id);
+    return {profile, config: redactModelConfig(config)};
+  }
+
+  async updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void> {
+    let stored = this.#getHandAddedModel(profile.id).config;
+    if (config.provider !== stored.provider || config.model !== stored.model) {
+      throw new Error("A model's provider and model ID can't be changed.");
+    }
+    this.#putModel(profile, resolveWithheldSecrets(config, stored));
+  }
+
+  /** The stored record of a model the user added, throwing for AI Gateway models. */
+  #getHandAddedModel(id: string): UserAiModelRecord {
+    let record = this.storage.aiModels.get(id);
+    // A stored model sharing a gateway model's ID is shadowed by it (see listModels()).
+    if (!record || getAiGatewayConfig(this.env)?.resolveModel(id)) {
+      throw new Error(`No such hand-added model: ${id}`);
+    }
+    return record;
+  }
+
+  #putModel(profile: AiChatAuthorInfo, config: AiModelConfig) {
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
+    }
+    for (let limit of [config.contextWindow, config.outputLimit]) {
+      if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
+        throw new Error("Token limits must be positive integers.");
+      }
     }
 
     profile.type = "agent";
@@ -1895,10 +2028,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Block whole gatekeepers + disabled resources at this single core-side chokepoint where a
     // resourceUrl becomes a capability (reached only via the user/UI-facing Overseer.newGatekeeper
-    // and blueprint instantiation — never from gadget or agent code).
+    // and blueprint instantiation — never from gadget or agent code). An ambient gatekeeper an admin
+    // set to "disabled" is blocked here too.
     let config = await readAdminConfig(this.env);
     let vendorId = account.vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(vendorId)) {
+    if (config.disabledGatekeepers.includes(vendorId) ||
+        ambientGatekeeperMode(config, vendorId) === "disabled") {
       throw new Error(
           `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
     }

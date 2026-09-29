@@ -2,7 +2,7 @@ import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import { GmailForwardSnapshotStore } from "../../src/gmail-state";
 import { GmailGatekeeperImpl, type GmailGatekeeperImplProps } from "../../src/gmail";
 import { UserAccount } from "../../src/google";
-import type {ActionKind} from "@gadgets/workshop-shared/gatekeeper";
+import type { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {TestGitCache} from "../test-git-cache";
 import type {
   GmailComposeOptions, GmailDraftInput, GmailDraftPatch, GmailMessage, GmailReplyOptions,
@@ -143,6 +143,7 @@ class TestApprovalQueue extends RpcTarget {
 /** Test-only hook that creates and drives the props-bearing Gmail facet. */
 export class TestHooks extends DurableObject<Cloudflare.Env> {
   #queues = new Map<string, TestApprovalQueue>();
+
 
   #gatekeeper(
       facetName: string, id: string, props: GmailGatekeeperImplProps,
@@ -497,6 +498,25 @@ testGmailPrototype.runTestOperation = async function(
         return await Promise.all(messages.map(message => message.getMetadata()));
       } finally {
         for (const message of messages) disposeRpc(message);
+      }
+    } finally {
+      disposeRpc(thread);
+    }
+  }
+  case "thread.mutate": {
+    const thread = await session.getThread(id as string);
+    const lastMessageId = extra as string | undefined;
+    try {
+      switch (value) {
+        case "archive": return await thread.archive(lastMessageId);
+        case "trash": return await thread.trash(lastMessageId);
+        case "markRead": return await thread.markRead(lastMessageId);
+        case "markUnread": return await thread.markUnread(lastMessageId);
+        case "star": return await thread.star(lastMessageId);
+        case "unstar": return await thread.unstar(lastMessageId);
+        case "applyLabel": return await thread.applyLabel(options as never, lastMessageId);
+        case "removeLabel": return await thread.removeLabel(options as never, lastMessageId);
+        default: throw new Error(`Unknown thread mutation: ${String(value)}`);
       }
     } finally {
       disposeRpc(thread);
