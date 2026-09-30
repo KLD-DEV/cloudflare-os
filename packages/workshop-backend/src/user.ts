@@ -648,7 +648,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listModels(): Promise<AiChatAuthorInfo[]> {
     let result: AiChatAuthorInfo[] = [];
 
-    // When AI Gateway mode is active, include all suggested models for enabled providers.
+    // When AI Gateway mode is active, include suggested models for enabled providers,
+    // except ids listed in CF_AI_GATEWAY_HIDDEN_MODELS.
     let gwConfig = getAiGatewayConfig(this.env);
     let gwModelIds = new Set<string>();
     if (gwConfig) {

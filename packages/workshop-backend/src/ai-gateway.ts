@@ -34,6 +34,8 @@ export class AiGatewayConfig {
    */
   readonly binding?: Ai;
   readonly providers: Set<string>;
+  /** Catalog model ids omitted from the picker. Existing chats that name one no longer resolve it. */
+  readonly hiddenModels: Set<string>;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -62,6 +64,9 @@ export class AiGatewayConfig {
     this.providers = new Set(
       (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
     );
+    this.hiddenModels = new Set(
+      (env.CF_AI_GATEWAY_HIDDEN_MODELS || "").split(",").map(s => s.trim()).filter(s => s !== "")
+    );
     const httpsOnly = [...this.providers].filter(p => HTTPS_ONLY_PROVIDERS.has(p));
     if (httpsOnly.length > 0 && !this.apiToken) {
       const names = httpsOnly.join(", ");
@@ -89,6 +94,7 @@ export class AiGatewayConfig {
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
       if (this.providers.has(provider)) {
         for (let [id, model] of Object.entries(models)) {
+          if (this.hiddenModels.has(id)) continue;
           result.push({ type: "agent", id, name: model.name });
         }
       }
@@ -101,6 +107,7 @@ export class AiGatewayConfig {
    * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
    */
   resolveModel(modelId: string): UserAiModelRecord | undefined {
+    if (this.hiddenModels.has(modelId)) return undefined;
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
       if (this.providers.has(provider) && modelId in models) {
         return {

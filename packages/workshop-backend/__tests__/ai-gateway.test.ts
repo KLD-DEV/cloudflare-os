@@ -223,3 +223,20 @@ describe("getAiGatewayLogCost", () => {
         .rejects.toBeInstanceOf(AiGatewayLogRetryableError);
   });
 });
+
+describe("hidden catalog models", () => {
+  it("omits them from the picker and refuses to resolve them", () => {
+    const config = new AiGatewayConfig(env({
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_PROVIDERS: "anthropic,cloudflare",
+      CF_AI_GATEWAY_HIDDEN_MODELS: "claude-opus-5, claude-fable-5-1",
+    }));
+    const ids = config.getModelList().map(model => model.id);
+    expect(ids).not.toContain("claude-opus-5");
+    expect(ids).not.toContain("claude-fable-5-1");
+    expect(ids).toContain("claude-sonnet-5");
+    expect(ids).toContain("@cf/zai-org/glm-5.2");
+    expect(config.resolveModel("claude-opus-5")).toBeUndefined();
+    expect(config.resolveModel("claude-sonnet-5")?.profile.name).toBe("Claude Sonnet 5");
+  });
+});
