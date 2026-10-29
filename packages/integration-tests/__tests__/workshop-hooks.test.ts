@@ -3,7 +3,8 @@ import type { RpcStub } from "capnweb";
 import type { BoundHookInfo, Overseer } from "@gadgets/workshop-shared/api";
 import type { HookTargetMetadata } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  ADMIN_USERNAME, startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  ADMIN_USERNAME, hookServer, startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState,
+  testControl, type Harness,
 } from "../src/harness.js";
 import { SCRIPTED_MODEL_ID, scriptedModelRouter } from "../src/mock-model.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
@@ -31,42 +32,18 @@ afterAll(async () => {
   }
 });
 
-const HOOK_SERVER = `import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
-export class Gadget extends DurableObject {
-  async [restore](params) {
-    if (params.type !== "value-hook") throw new TypeError("Unknown restore type: " + params.type);
-    return new ValueHook(this.env.TEST_AMBIENT);
-  }
-}
-class ValueHook extends RpcTarget {
-  constructor(thing) { super(); this.thing = thing; }
-  async onValueRequested(value) { await this.thing.writeValue(value); }
-}`;
-
 const watchCode = (keys: string[]) => `import { restore } from "cloudflare:workers";
 export default async function(self, env) {
   for (const key of ${JSON.stringify(keys)}) {
-    await env.TEST_AMBIENT.watch(key, await env.HOOKED[restore]({ type: "value-hook" }));
+    await env.TEST_AMBIENT.watch(key, await env.HOOKED.rpc[restore]({ type: "value-hook" }));
   }
 }`;
 
-type FireResult = { fired: true } | { error: string };
 type HookState = { enabled: boolean; target?: HookTargetMetadata; disableCount: number };
-type ActionState = { pending: { id: number; value: number }[]; value?: number; applyCount: number };
 
-async function control<T>(route: string, body: object): Promise<T> {
-  const response = await harness.fetchWorker(
-      TEST_GATEKEEPER_WORKER, `http://gatekeeper-test.test/control/${route}`,
-      { method: "POST", body: JSON.stringify(body) });
-  if (response.status !== 200) {
-    throw new Error(`/control/${route} failed with ${response.status}: ${await response.text()}`);
-  }
-  return await response.json() as T;
-}
-
-const fire = (key: string, value: number) => control<FireResult>("fire-hook", { key, value });
-const hookState = (key: string) => control<HookState>("hook-state", { key });
-const actionState = (label: string) => control<ActionState>("action-state", { label });
+const fire = (key: string, value: number) => testControl(harness, "fire-hook", { key, value });
+const hookState = (key: string) => testControl<HookState>(harness, "hook-state", { key });
+const actionState = (label: string) => testActionState(harness, label);
 
 type ArmedHooks = Disposable & {
   username: string;
@@ -88,7 +65,7 @@ async function armHooks(prefix: string, names: string[]): Promise<ArmedHooks> {
         {
           id: "write",
           name: "writeFile",
-          arguments: { workpiece: "HOOKED", filename: "server.js", content: HOOK_SERVER },
+          arguments: { workpiece: "HOOKED", filename: "server.js", content: hookServer("TEST_AMBIENT") },
         },
         {
           id: "bind",
@@ -111,7 +88,7 @@ async function armHooks(prefix: string, names: string[]): Promise<ArmedHooks> {
   await api.provisionAmbientAccount(TEST_VENDOR_ID);
   const account = await waitFor("the ambient account", async () =>
     (await listConnectedAccounts(api)).find(a => a.vendorId === TEST_VENDOR_ID) ?? null);
-  const ws = stack.use(await api.newGadget());
+  const ws = stack.use(await api.newWorkspace());
   const { id: workspaceId } = await ws.getMetadata();
 
   const chatId = await ws.newChat("Build a hooked gadget.", SCRIPTED_MODEL_ID);
@@ -169,7 +146,7 @@ it("an enabled hook fires into a restarted workspace; disabled and deleted hooks
 
   using publicApi = connect(harness.url);
   using api = await logIn(publicApi, username);
-  using reopened = await api.openGadget(workspaceId);
+  using reopened = await api.openWorkspace(workspaceId);
   expect(await streamGeneration(reopened)).not.toBe(generation);
 
   expect(await fire(keys.live, 101)).toEqual({ fired: true });

@@ -1,5 +1,5 @@
 import {
-  group, hasInfrastructureFailure, parseResults, trials, type Assertion, type Cohort,
+  group, hasInfrastructureFailure, parseResults, trials, type Assertion, type Cohort, type StepUsage,
 } from "./results.ts";
 
 export type EvalStats = {
@@ -12,8 +12,19 @@ export type EvalStats = {
   meanModelTurns: number;
   meanToolCalls: number;
   meanToolErrors: number;
-  /** Null when any trial lacks a cost: a mean over a subset would not compare across sides. */
-  meanCostUsd: number | null;
+  /**
+   * The share of all the trials' prompt tokens that the provider's prompt cache served. Null when
+   * any trial lacks the counts, as one that never finished a model step does.
+   */
+  cacheHitRate: number | null;
+  /**
+   * Of the prompt tokens the step before had already sent, the share a step sent again instead
+   * of reading them from the cache, over all the trials' steps. Unlike `cacheHitRate`, it leaves
+   * out new tokens, but each step that reads them all from the cache still lowers it, so runs
+   * with more steps show a lower rate for the same misses. Null when any trial lacks per-step
+   * counts.
+   */
+  cacheBreakRate: number | null;
   /**
    * Each check that failed in some trial, by turn, with how many trials failed it and the evidence
    * of the first. A turn the agent did not complete fails as `agent.<outcome>`. Leaves out
@@ -29,11 +40,16 @@ export type EvalStats = {
 };
 
 /**
- * One task/model cohort. `reason` is null exactly when the two sides can be compared, and then
- * `pValue` is the two-sided Fisher exact test on their pass counts.
+ * One task/model cohort. `reason` is null exactly when the two sides can be compared. Then
+ * `pValue` is the two-sided Fisher exact test on their pass counts, and the cache p-values test
+ * each trial's own rate (Mann-Whitney U) in the direction the pooled rate moved, null when a side
+ * lacks the rates.
  */
 export type EvalComparisonRow = { taskId: string; model: string } & (
-  | { reason: null; baseline: EvalStats; candidate: EvalStats; pValue: number }
+  | {
+    reason: null; baseline: EvalStats; candidate: EvalStats; pValue: number;
+    cacheHitPValue: number | null; cacheBreakPValue: number | null;
+  }
   | { reason: string; baseline: EvalStats | null; candidate: EvalStats | null }
 );
 
@@ -61,7 +77,7 @@ export type EvalComparison = {
  */
 const SAME_INPUTS = "same inputs";
 
-/** The significance a pass-rate change must reach to count as improved or regressed. */
+/** The p-value a change must fall below to count as beyond noise. */
 const SIGNIFICANCE = 0.05;
 
 function mean(values: number[]): number {
@@ -98,11 +114,58 @@ function infrastructureMessage(assertion: Assertion): string {
   return turn?.outcome.message ?? run.errors[0]?.message ?? "infrastructure failure";
 }
 
+/** Some of a trial's prompt tokens, out of a whole. */
+type Share = { part: number; whole: number };
+
+/** The prompt tokens the trial's cache served, out of all it sent, when it recorded them. */
+function cacheHitShare(assertion: Assertion): Share | null {
+  const { cumulativePromptTokens: whole, cumulativeCacheReadTokens: part } =
+    assertion.meta.harness.run.usage.metadata;
+  return whole === undefined || part === undefined ? null : { part, whole };
+}
+
+/**
+ * The prompt tokens the trial's steps sent again instead of reading them from the cache, out of
+ * those the step before had already sent (at most a step's own prompt, which compaction
+ * shortens). A record covering several model steps says nothing about the step before it, so it
+ * is skipped, and so is the step after it.
+ */
+function cacheBreakShare(assertion: Assertion): Share | null {
+  const steps = assertion.meta.harness.run.usage.metadata.steps;
+  if (steps === undefined) return null;
+  const tokens = (step: StepUsage) => step.uncachedTokens + step.cacheReadTokens + step.cacheWriteTokens;
+  let part = 0;
+  let whole = 0;
+  for (const [index, step] of steps.entries()) {
+    const previous = steps[index - 1];
+    if (previous === undefined || previous.modelSteps !== undefined || step.modelSteps !== undefined) {
+      continue;
+    }
+    const repeated = Math.min(tokens(previous), tokens(step));
+    part += Math.max(0, repeated - step.cacheReadTokens);
+    whole += repeated;
+  }
+  return { part, whole };
+}
+
+/** One trial's share as a rate, or null when it lacks the share or the whole is 0. */
+function rateOf(share: Share | null): number | null {
+  return share === null || share.whole === 0 ? null : share.part / share.whole;
+}
+
+/** The trials' shares summed, as a rate: null when a trial lacks its share or the whole is 0. */
+function pooledRate(shares: readonly (Share | null)[]): number | null {
+  let part = 0;
+  let whole = 0;
+  for (const share of shares) {
+    if (share === null) return null;
+    part += share.part;
+    whole += share.whole;
+  }
+  return rateOf({ part, whole });
+}
+
 function stats({ assertions }: Cohort): EvalStats {
-  const costs = assertions.flatMap(assertion => {
-    const cost = assertion.meta.harness.run.usage.metadata.observedCumulativeChatCostUsd;
-    return cost === undefined ? [] : [cost];
-  });
   const runs = assertions.map(assertion => assertion.meta.harness.run);
   const metrics = runs.map(run => run.output.metrics);
   // A crash's check results say nothing about the agent's work.
@@ -127,7 +190,8 @@ function stats({ assertions }: Cohort): EvalStats {
     meanModelTurns: mean(metrics.map(value => value.modelTurns)),
     meanToolCalls: mean(metrics.map(value => value.toolCalls)),
     meanToolErrors: mean(metrics.map(value => value.toolErrors)),
-    meanCostUsd: costs.length === assertions.length ? mean(costs) : null,
+    cacheHitRate: pooledRate(assertions.map(cacheHitShare)),
+    cacheBreakRate: pooledRate(assertions.map(cacheBreakShare)),
     failedChecks: failedChecks.map(({ item, count }) => ({ ...item, trials: count })),
     turnsReached: Array.from({ length: Math.max(0, ...turns.map(trial => trial.length)) },
       (_, index) => turns.filter(trial => trial.length > index).length),
@@ -171,6 +235,55 @@ function fisherExact(baseline: EvalStats, candidate: EvalStats): number {
     if (chance <= observed * (1 + 1e-7)) total += chance;
   }
   return Math.min(1, total);
+}
+
+/**
+ * Exact Mann-Whitney U test that the candidate's values moved the way `higher` says: twice the
+ * chance, were both sides' values drawn from one distribution, of a candidate rank sum at least
+ * that far that way, capped at 1. Tied values share their mean rank.
+ */
+function mannWhitney(
+    baseline: readonly number[], candidate: readonly number[], higher: boolean): number {
+  const values = [...baseline, ...candidate].toSorted((left, right) => left - right);
+  // Twice each value's mean rank, which keeps tied ranks whole.
+  const rank = (value: number) => values.indexOf(value) + values.lastIndexOf(value) + 2;
+  const size = candidate.length;
+  const observed = candidate.reduce((sum, value) => sum + rank(value), 0);
+  // sets[count][sum]: how many sets of `count` values have doubled ranks adding up to `sum`.
+  const sets = Array.from({ length: size + 1 },
+    () => new Float64Array(values.length * (values.length + 1) + 1));
+  sets[0][0] = 1;
+  for (const value of values) {
+    const doubled = rank(value);
+    for (let count = size; count >= 1; count--) {
+      for (let sum = sets[count].length - 1; sum >= doubled; sum--) {
+        sets[count][sum] += sets[count - 1][sum - doubled];
+      }
+    }
+  }
+  let tail = 0;
+  let total = 0;
+  sets[size].forEach((count, sum) => {
+    total += count;
+    if (higher ? sum >= observed : sum <= observed) tail += count;
+  });
+  return Math.min(1, 2 * tail / total);
+}
+
+const complete = (values: readonly (number | null)[]): values is number[] => !values.includes(null);
+
+/**
+ * A Mann-Whitney U test that each trial's rate moved the way the pooled rate did: null when some
+ * trial lacks its rate, so different trial populations are never compared, and 1 when the pooled
+ * rate did not move.
+ */
+function rateTest(
+    baseline: Cohort, candidate: Cohort, share: (assertion: Assertion) => Share | null): number | null {
+  const shares = [baseline, candidate].map(({ assertions }) => assertions.map(share));
+  const [before, after] = shares.map(pooledRate);
+  const [left, right] = shares.map(side => side.map(rateOf));
+  if (before === null || after === null || !complete(left) || !complete(right)) return null;
+  return before === after ? 1 : mannWhitney(left, right, after > before);
 }
 
 /** Whether every task's two sides are one reused result, so nothing the evals run changed. */
@@ -218,7 +331,9 @@ export function compareEvalResults(
       return { ...identity, reason, baseline: baselineStats, candidate: candidateStats };
     }
     return { ...identity, reason, baseline: baselineStats, candidate: candidateStats,
-      pValue: fisherExact(baselineStats, candidateStats) };
+      pValue: fisherExact(baselineStats, candidateStats),
+      cacheHitPValue: rateTest(base, next, cacheHitShare),
+      cacheBreakPValue: rateTest(base, next, cacheBreakShare) };
   }).toSorted((left, right) =>
     left.taskId.localeCompare(right.taskId) || left.model.localeCompare(right.model));
   return { baselineSha, candidateSha, verdict: verdictOf(rows), rows };
@@ -259,11 +374,38 @@ function score(side: EvalStats): string {
   return count === 0 ? percent : `${percent}${NBSP}(${errors})`;
 }
 
-/** The pass-rate change, in percentage points. */
-function passChange(row: ComparedRow): string {
-  const delta = (passRate(row.candidate) - passRate(row.baseline)) * 100;
+/** A change in percentage points. */
+function points(delta: number): string {
   const sign = delta > 0 ? "+" : delta < 0 ? "\u2212" : "";
   return `${sign}${Math.abs(delta).toFixed(0)}${NBSP}pp`;
+}
+
+/** The pass-rate change, in percentage points. */
+function passChange(row: ComparedRow): string {
+  return points((passRate(row.candidate) - passRate(row.baseline)) * 100);
+}
+
+/** A side's prompt cache hit rate, as a whole percentage. */
+function cachePercent(side: EvalStats): number | null {
+  return side.cacheHitRate === null ? null : Math.round(side.cacheHitRate * 100);
+}
+
+/**
+ * Each side's prompt cache hit rate and, when both sides have one and the task compares, its
+ * change on a second line, in bold when the trials' rates differ beyond noise.
+ */
+function cacheHits(row: EvalComparisonRow): string {
+  const rates = sides(row, side => {
+    const value = cachePercent(side);
+    return value === null ? null : `${value}%`;
+  });
+  if (row.reason !== null) return rates;
+  const baseline = cachePercent(row.baseline);
+  const candidate = cachePercent(row.candidate);
+  if (baseline === null || candidate === null) return rates;
+  const change = points(candidate - baseline);
+  return row.cacheHitPValue !== null && row.cacheHitPValue < SIGNIFICANCE
+    ? `${rates}<br>**${change}**` : `${rates}<br>${change}`;
 }
 
 /** A p-value to two decimals, or a bound where two decimals would round it to zero. */
@@ -303,10 +445,9 @@ function failedCheckRows(row: EvalComparisonRow, task: string): string[] {
 
 /**
  * Render the comparison for a pull request comment: the verdict, then one table with each task's
- * score on both sides, its change and Fisher test, and each side's average minutes, cost and
- * steps per run. Headers are short so the table fits a comment's width unwrapped. A collapsed
- * table lists each check that failed on either side of a task whose inputs changed; Bonk's review
- * explains the failures.
+ * score on both sides, its change and Fisher test, its prompt cache hit rate and that change, and
+ * each side's average minutes and steps per run. A collapsed table lists each check that failed on
+ * either side of a task whose inputs changed; Bonk's review explains the failures.
  */
 export function renderEvalComparison(comparison: EvalComparison): string {
   const { rows } = comparison;
@@ -331,7 +472,7 @@ export function renderEvalComparison(comparison: EvalComparison): string {
   const lines = [
     "# Eval results", "",
     `**Verdict: ${VERDICT[comparison.verdict]}.** ${why}`, "",
-    "| Task | Score | \u0394 score | Fisher test | Avg min | Avg $ | Avg steps |",
+    "| Task | Score | \u0394 score | Fisher test | Cache hits | Avg min | Avg steps |",
     "| --- | --- | --- | --- | --- | --- | --- |",
   ];
   for (const row of rows) {
@@ -340,9 +481,8 @@ export function renderEvalComparison(comparison: EvalComparison): string {
       : pValueText(row.pValue);
     lines.push(`| ${[
       name(row), sides(row, score),
-      row.reason === null ? passChange(row) : `_${row.reason}_`, fisher,
+      row.reason === null ? passChange(row) : `_${row.reason}_`, fisher, cacheHits(row),
       sides(row, side => (side.meanDurationMs / 60_000).toFixed(1)),
-      sides(row, side => side.meanCostUsd?.toFixed(3) ?? null),
       sides(row, side => side.meanModelTurns.toFixed(1)),
     ].join(" | ")} |`);
   }

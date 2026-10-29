@@ -15,9 +15,8 @@ import type { RpcStub } from "capnweb";
 import type {
   ActionLogEntry, AuthenticatedApi, Overseer, PublicApi,
 } from "@gadgets/workshop-shared/api";
-import { z } from "zod";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState, type Harness,
 } from "../src/harness.js";
 import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
@@ -63,21 +62,7 @@ async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<Connect
   });
 }
 
-const TEST_ACTION_STATE = z.object({
-  pending: z.array(z.object({ id: z.number(), value: z.number() })),
-  value: z.number().optional(),
-  applyCount: z.number(),
-});
-
-async function actionState(label: string) {
-  const response = await harness.fetchWorker(
-      TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/action-state",
-      { method: "POST", body: JSON.stringify({ label }) });
-  if (response.status !== 200) {
-    throw new Error(`Reading test action state failed with ${response.status}: ${await response.text()}`);
-  }
-  return TEST_ACTION_STATE.parse(await response.json());
-}
+const actionState = (label: string) => testActionState(harness, label);
 
 type Workspace = {
   overseer: RpcStub<Overseer>;
@@ -90,7 +75,7 @@ async function newWorkspace(publicApi: RpcStub<PublicApi>, thingName: string): P
   const [alice] = nextUsernames("alice");
   const aliceApi = await signUp(publicApi, alice);
   const account = await provisionAccount(aliceApi);
-  const overseer = await aliceApi.newGadget();
+  const overseer = await aliceApi.newWorkspace();
   const gatekeeper = await overseer.newGatekeeper(
       account.id, `https://gadgets-test.example/things/${thingName}`);
   if (!gatekeeper) throw new Error("Failed to create the test connection");

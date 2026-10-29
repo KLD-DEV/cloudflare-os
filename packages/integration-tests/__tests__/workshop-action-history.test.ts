@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { RpcPromise, RpcStub } from "capnweb";
-import { z } from "zod";
 import {
   actionChangeTime, type ActionHistoryFilter, type ActionLogEntry, type ActionsSubscriber,
   type AuthenticatedApi, type GatekeeperClient, type Overseer,
 } from "@gadgets/workshop-shared/api";
 import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState, type Harness,
 } from "../src/harness.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
@@ -69,21 +68,7 @@ const ids = (entries: ActionLogEntry[]) => entries.map(e => e.id);
 const idsDown = (from: number, to: number) =>
   Array.from({ length: from - to + 1 }, (_, i) => from - i);
 
-const TEST_ACTION_STATE = z.object({
-  pending: z.array(z.object({ id: z.number(), value: z.number() })),
-  value: z.number().optional(),
-  applyCount: z.number(),
-});
-
-async function actionState(label: string) {
-  const response = await harness.fetchWorker(
-      TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/action-state",
-      { method: "POST", body: JSON.stringify({ label }) });
-  if (response.status !== 200) {
-    throw new Error(`Reading test action state failed with ${response.status}: ${await response.text()}`);
-  }
-  return TEST_ACTION_STATE.parse(await response.json());
-}
+const actionState = (label: string) => testActionState(harness, label);
 
 async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<ConnectedAccount> {
   await api.provisionAmbientAccount(TEST_VENDOR_ID);
@@ -102,7 +87,7 @@ async function reopenAfterRestart(
         new ObserverConfigRecorder().alwaysChoose(observerAccountId, MAX_OBSERVER_PROMPTS));
     try {
       const api = await logIn(stack.use(connect(harness.url)), username);
-      const overseer = stack.use(await api.openGadget(workspaceId, undefined, callback));
+      const overseer = stack.use(await api.openWorkspace(workspaceId, undefined, callback));
       await overseer.getMetadata();
       return Object.assign(stack.move(), { overseer });
     } catch {
@@ -123,7 +108,7 @@ it("pages, filters, streams and replays a workspace's action history", async () 
     await api.provisionAmbientAccount(TEST_VENDOR_ID);
     const account = await waitFor("the test account", async () =>
       (await listConnectedAccounts(api)).find(a => a.vendorId === TEST_VENDOR_ID) ?? null);
-    using ws = await api.newGadget();
+    using ws = await api.newWorkspace();
     workspaceId = (await ws.getMetadata()).id;
     using gatekeeper = await ws.newGatekeeper(
         account.id, "https://gadgets-test.example/things/action-history");
@@ -164,7 +149,7 @@ it("pages, filters, streams and replays a workspace's action history", async () 
 
   using publicApi = connect(harness.url);
   using api = await logIn(publicApi, owner);
-  using ws = await api.openGadget(workspaceId);
+  using ws = await api.openWorkspace(workspaceId);
   using gatekeeper = await ws.getGatekeeperById(gatekeeperId);
   using session = await gatekeeper.openSession() as RpcStub<TestSession>;
   await writeValues(session, 1055, 1058);
@@ -195,7 +180,7 @@ it("approvals route to the account whose connection staged the write", async () 
   using setup = new DisposableStack();
   const aliceApi = setup.use(await signUp(setup.use(connect(harness.url)), alice));
   const aliceAccount = await provisionAccount(aliceApi);
-  const ws = setup.use(await aliceApi.newGadget());
+  const ws = setup.use(await aliceApi.newWorkspace());
   const workspaceId = (await ws.getMetadata()).id;
   const aliceGatekeeper = await ws.newGatekeeper(
       aliceAccount.id, "https://gadgets-test.example/things/routing-alice");
@@ -207,7 +192,7 @@ it("approvals route to the account whose connection staged the write", async () 
   if (!await ws.addCollaborator(bob, "build")) throw new Error("Failed to add Bob");
   const callback = setup.use(stubFor(
       new ObserverConfigRecorder().alwaysChoose(bobAccount.id, MAX_OBSERVER_PROMPTS)));
-  const bobWs = setup.use(await bobApi.openGadget(workspaceId, undefined, callback));
+  const bobWs = setup.use(await bobApi.openWorkspace(workspaceId, undefined, callback));
   // A live build collaborator makes this account-requiring connection restart the workspace
   // ~100ms after the call; pipelining getId() fetches the id before the abort.
   const bobGatekeeperId = await (bobWs.newGatekeeper(

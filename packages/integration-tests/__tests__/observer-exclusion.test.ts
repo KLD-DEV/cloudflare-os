@@ -8,7 +8,7 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_VENDOR_ID, testControl, type Harness,
 } from "../src/harness.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
@@ -62,7 +62,7 @@ async function newWorkspace(publicApi: RpcStub<PublicApi>, thingName: string): P
   const [alice] = nextUsernames("alice");
   const aliceApi = await signUp(publicApi, alice);
   const account = await provisionAccount(aliceApi);
-  const overseer = await aliceApi.newGadget();
+  const overseer = await aliceApi.newWorkspace();
   using gatekeeper = await overseer.newGatekeeper(account.id, thingUrl(thingName));
   if (!gatekeeper) throw new Error("Failed to create the test connection");
   const gatekeeperId = await gatekeeper.getId();
@@ -84,7 +84,7 @@ async function reopenAfterRestart(ws: Workspace) {
     const publicApi = connect(harness.url);
     try {
       using api = await logIn(publicApi, ws.alice);
-      using overseer = await api.openGadget(ws.gadgetId);
+      using overseer = await api.openWorkspace(ws.gadgetId);
       using gatekeeper = await overseer.getGatekeeperById(ws.gatekeeperId);
       const session = await gatekeeper.openSession() as RpcStub<TestSession>;
       await session.readValue();
@@ -100,13 +100,8 @@ type ObserverEvent = { resourceUrl: string; type: "add" | "remove"; id: string }
 
 /** The addObserver()/removeObserver() calls one binding's gatekeeper has seen, in order. */
 async function observerEvents(resourceUrl: string): Promise<ObserverEvent[]> {
-  const res = await harness.fetchWorker(
-    TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/observer-events",
-    { method: "POST", body: JSON.stringify({ resourceUrl }) });
-  if (res.status !== 200) {
-    throw new Error(`Reading observer events failed with ${res.status}: ${await res.text()}`);
-  }
-  return (await res.json() as { events: ObserverEvent[] }).events;
+  return (await testControl<{ events: ObserverEvent[] }>(harness, "observer-events", { resourceUrl }))
+    .events;
 }
 
 /**
@@ -123,7 +118,7 @@ async function verifiedCollaborator(
   const before = await observerEvents(resourceUrl);
   const callback =
       stubFor(new ObserverConfigRecorder().alwaysChoose(account.id, MAX_OBSERVER_PROMPTS));
-  using _ws = await api.openGadget(ws.gadgetId, undefined, callback)
+  using _ws = await api.openWorkspace(ws.gadgetId, undefined, callback)
       .finally(() => callback[Symbol.dispose]());
   const events = (await observerEvents(resourceUrl)).slice(before.length);
   expect(events).toMatchObject([{ type: "add" }]);
